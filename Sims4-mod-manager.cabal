@@ -1,0 +1,27 @@
+cabal-version:      3.0
+name:               Sims4-mod-manager
+version:            0.1.0.0
+license:            BSD-3-Clause
+license-file:       LICENSE
+author:             stamnostomp
+maintainer:         stamno@pm.me
+build-type:         Simple
+extra-doc-files:    CHANGELOG.md
+
+common warnings
+    ghc-options: -Wall
+
+executable Sims4-mod-manager
+    import:           warnings
+    main-is:          Main.hs
+    build-depends:    base ^>=4.20.2.0
+                    , gi-adwaita
+                    , gi-gdk == 4.0.*
+                    , gi-gio
+                    , gi-gtk == 4.0.*
+                    , haskell-gi-base
+                    , text
+                    , directory
+                    , filepath
+    hs-source-dirs:   app
+    default-language: Haskell2010
