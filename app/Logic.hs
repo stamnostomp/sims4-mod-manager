@@ -16,6 +16,7 @@ module Logic
   , copyModToFolder
   , validateModsFolder
   , validateModFile
+  , importMod
   ) where
 
 import Control.Exception (SomeException, catch)
@@ -224,3 +225,15 @@ validateModFile path = do
       if ext /= ".package" && ext /= ".ts4script"
         then return (Left "Only .package and .ts4script files are supported.")
         else return (Right path)
+
+-- | Validate, copy a mod file into the configured mods folder, and return
+-- the new ModInfo. Returns Left with an error message on failure.
+importMod :: FilePath -> String -> IO (Either Text ModInfo)
+importMod filePath customModPath = do
+  result <- validateModFile filePath
+  case result of
+    Left err -> return (Left err)
+    Right validPath -> do
+      modsDir <- getModsFolder customModPath
+      modInfo <- copyModToFolder validPath modsDir
+      return (Right modInfo)

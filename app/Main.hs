@@ -309,7 +309,19 @@ onActivate app = do
         Adw.windowTitleSetSubtitle winTitle
           (T.pack (show (length newMods)) <> " mods found")
 
-  -- ── Add Mod: browse button opens native file picker ───────────────
+  -- Helper: import a mod file via Logic, update UI
+  let doImportMod filePath = do
+        curState <- readIORef stateRef
+        result <- importMod filePath (wsModPath curState)
+        case result of
+          Left err -> set statusLabel [#label := err]
+          Right _ -> do
+            rescanMods
+            Gtk.editableSetText pathEntry ("" :: Text)
+            set statusLabel [#label := "Added!"]
+            Gtk.popoverPopdown addPopover
+
+  -- ── Add Mod: browse button opens native file picker and imports ───
   _ <- on addBrowseBtn #clicked $ do
     fileDialog <- new Gtk.FileDialog [#title := "Select Mod File"]
 
@@ -329,26 +341,15 @@ onActivate app = do
         ) `catch` (\(_ :: SomeException) -> return Nothing)
       case result of
         Nothing -> return ()
-        Just path -> Gtk.editableSetText pathEntry (T.pack path)
+        Just path -> doImportMod path
       )
 
-  -- Add Mod: confirm button
+  -- Add Mod: confirm button (for manual path entry)
   _ <- on confirmBtn #clicked $ do
     filePath <- T.unpack . T.strip <$> Gtk.editableGetText pathEntry
     if null filePath
       then set statusLabel [#label := "Please enter a file path."]
-      else do
-        result <- validateModFile filePath
-        case result of
-          Left err -> set statusLabel [#label := err]
-          Right validPath -> do
-            curState <- readIORef stateRef
-            modsDir <- getModsFolder (wsModPath curState)
-            _ <- copyModToFolder validPath modsDir
-            rescanMods
-            Gtk.editableSetText pathEntry ("" :: Text)
-            set statusLabel [#label := "Added!"]
-            Gtk.popoverPopdown addPopover
+      else doImportMod filePath
 
   -- ── Preferences: browse button opens native folder picker ─────────
   _ <- on prefsBrowseBtn #clicked $ do
