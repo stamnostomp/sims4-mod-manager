@@ -265,10 +265,29 @@ onActivate app = do
     , #halign := Gtk.AlignStart
     ]
 
+  detailCategory <- new Gtk.Label
+    [ #label := ""
+    , #halign := Gtk.AlignStart
+    ]
+
+  detailResources <- new Gtk.Label
+    [ #label := ""
+    , #halign := Gtk.AlignStart
+    ]
+
+  detailBreakdown <- new Gtk.Label
+    [ #label := ""
+    , #halign := Gtk.AlignStart
+    , #wrap := True
+    ]
+
   Gtk.boxAppend detailsBox detailTitle
   Gtk.boxAppend detailsBox detailPath
   Gtk.boxAppend detailsBox detailSize
   Gtk.boxAppend detailsBox detailType
+  Gtk.boxAppend detailsBox detailCategory
+  Gtk.boxAppend detailsBox detailResources
+  Gtk.boxAppend detailsBox detailBreakdown
 
   Gtk.panedSetEndChild paned (Just detailsBox)
 
@@ -292,6 +311,21 @@ onActivate app = do
             set detailPath  [#label := modPath m]
             set detailSize  [#label := "Size: " <> formatSize (modSize m)]
             set detailType  [#label := "Type: " <> modType m]
+            case modPackageInfo m of
+              Nothing -> do
+                set detailCategory  [#label := if modType m == "ts4script"
+                                                 then "Category: Script Mod"
+                                                 else ""]
+                set detailResources [#label := ""]
+                set detailBreakdown [#label := ""]
+              Just info -> do
+                set detailCategory  [#label := "Category: " <> pkgCategory info]
+                set detailResources [#label := "Resources: " <> T.pack (show (pkgResourceCount info))]
+                let breakdown = T.intercalate ", "
+                      [ T.pack (show cnt) <> " " <> name
+                      | (name, cnt) <- pkgResourceTypes info
+                      ]
+                set detailBreakdown [#label := breakdown]
           else return ()
 
   -- Helper: clear and rescan mod list
@@ -406,8 +440,13 @@ onActivate app = do
 -- | Add a row to the list box for one mod.
 addModRow :: Gtk.ListBox -> ModInfo -> IO ()
 addModRow listBox m = do
+  let cat = case modPackageInfo m of
+              Just info -> "  ·  " <> pkgCategory info
+              Nothing   -> if modType m == "ts4script"
+                             then "  ·  Script Mod"
+                             else ""
   row <- new Adw.ActionRow
     [ #title := modName m
-    , #subtitle := formatSize (modSize m) <> "  ·  " <> modType m
+    , #subtitle := formatSize (modSize m) <> "  ·  " <> modType m <> cat
     ]
   Gtk.listBoxAppend listBox row
