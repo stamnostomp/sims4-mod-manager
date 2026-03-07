@@ -1,5 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE OverloadedLabels #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
 module Main (main) where
@@ -11,129 +12,11 @@ import qualified GI.Gtk as Gtk
 import Data.GI.Base
 import Data.Text (Text)
 import qualified Data.Text as T
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, doesFileExist, getFileSize, getHomeDirectory, getXdgDirectory, listDirectory, XdgDirectory(..))
-import System.FilePath ((</>), takeDirectory, takeExtension, takeFileName)
 import Data.IORef
 import Control.Monad (when)
+import Control.Exception (SomeException, catch)
 
-data ModInfo = ModInfo
-  { modName :: Text
-  , modPath :: Text
-  , modSize :: Integer
-  , modType :: Text
-  }
-
-data WindowState = WindowState
-  { wsWidth :: Int
-  , wsHeight :: Int
-  , wsPanedPosition :: Int
-  , wsMaximized :: Bool
-  , wsModPath :: String
-  }
-
-defaultWindowState :: WindowState
-defaultWindowState = WindowState
-  { wsWidth = 900
-  , wsHeight = 600
-  , wsPanedPosition = 720  -- 80% of 900 (details pane gets 20%)
-  , wsMaximized = False
-  , wsModPath = ""
-  }
-
-stateFilePath :: IO FilePath
-stateFilePath = do
-  configDir <- getXdgDirectory XdgConfig "sims4-mod-manager"
-  return $ configDir </> "window-state.conf"
-
-loadWindowState :: IO WindowState
-loadWindowState = do
-  path <- stateFilePath
-  exists <- doesFileExist path
-  if not exists
-    then return defaultWindowState
-    else do
-      contents <- readFile path
-      return $ parseWindowState contents
-
-parseWindowState :: String -> WindowState
-parseWindowState contents = foldl applyPair defaultWindowState pairs
-  where
-    pairs = map parseLine (lines contents)
-    parseLine line = case break (== '=') line of
-      (key, '=':val) -> (key, val)
-      _              -> ("", "")
-    applyPair ws ("width", val)          = ws { wsWidth = readDef (wsWidth ws) val }
-    applyPair ws ("height", val)         = ws { wsHeight = readDef (wsHeight ws) val }
-    applyPair ws ("paned-position", val) = ws { wsPanedPosition = readDef (wsPanedPosition ws) val }
-    applyPair ws ("maximized", val)      = ws { wsMaximized = val == "true" }
-    applyPair ws ("mod-path", val)       = ws { wsModPath = val }
-    applyPair ws _                       = ws
-    readDef d s = case reads s of
-      [(v, "")] -> v
-      _         -> d
-
-saveWindowState :: FilePath -> WindowState -> IO ()
-saveWindowState path ws = do
-  createDirectoryIfMissing True (takeDirectory path)
-  writeFile path $ unlines
-    [ "width=" ++ show (wsWidth ws)
-    , "height=" ++ show (wsHeight ws)
-    , "paned-position=" ++ show (wsPanedPosition ws)
-    , "maximized=" ++ if wsMaximized ws then "true" else "false"
-    , "mod-path=" ++ wsModPath ws
-    ]
-
--- | Recursively find all .package and .ts4script files under a directory.
-findMods :: FilePath -> IO [ModInfo]
-findMods root = do
-  exists <- doesDirectoryExist root
-  if not exists
-    then return []
-    else go root
-  where
-    go dir = do
-      entries <- listDirectory dir
-      fmap concat $ mapM (processEntry dir) entries
-
-    processEntry dir entry = do
-      let full = dir </> entry
-      isDir <- doesDirectoryExist full
-      if isDir
-        then go full
-        else case takeExtension entry of
-          ext | ext == ".package" || ext == ".ts4script" -> do
-            size <- getFileSize full
-            return
-              [ ModInfo
-                  { modName = T.pack (takeFileName entry)
-                  , modPath = T.pack full
-                  , modSize = size
-                  , modType = T.pack (drop 1 ext)
-                  }
-              ]
-          _ -> return []
-
--- | Format a file size for display.
-formatSize :: Integer -> Text
-formatSize bytes
-  | bytes >= 1048576 = T.pack (show (bytes `div` 1048576)) <> " MB"
-  | bytes >= 1024    = T.pack (show (bytes `div` 1024)) <> " KB"
-  | otherwise        = T.pack (show bytes) <> " B"
-
--- | Scan both common Sims 4 Mods directories and return all mods found.
-scanMods :: IO [ModInfo]
-scanMods = do
-  home <- System.Directory.getHomeDirectory
-  let paths =
-        [ home </> "Documents" </> "Electronic Arts" </> "The Sims 4" </> "Mods"
-        , home </> ".local" </> "share" </> "The Sims 4" </> "Mods"
-        ]
-  fmap concat $ mapM findMods paths
-
--- | Scan mods from a custom path, or default locations if empty.
-scanModsFrom :: String -> IO [ModInfo]
-scanModsFrom "" = scanMods
-scanModsFrom path = findMods path
+import Logic
 
 main :: IO ()
 main = do
@@ -187,10 +70,131 @@ onActivate app = do
     ]
   Adw.headerBarSetTitleWidget headerBar (Just winTitle)
 
-  -- Settings button
-  settingsBtn <- new Gtk.Button [#iconName := "preferences-system-symbolic"]
+  -- ── Settings popover ──────────────────────────────────────────────
+  settingsBtn <- new Gtk.MenuButton [#iconName := "preferences-system-symbolic"]
   Gtk.widgetSetTooltipText settingsBtn (Just "Preferences")
+
+  prefsBox <- new Gtk.Box
+    [ #orientation := Gtk.OrientationVertical
+    , #spacing := 8
+    , #marginTop := 8
+    , #marginBottom := 8
+    , #marginStart := 8
+    , #marginEnd := 8
+    ]
+  Gtk.widgetSetSizeRequest prefsBox 400 (-1)
+
+  prefsLabel <- new Gtk.Label
+    [ #label := "Mods Folder (leave empty for default):"
+    , #halign := Gtk.AlignStart
+    ]
+
+  prefsEntryBox <- new Gtk.Box
+    [ #orientation := Gtk.OrientationHorizontal
+    , #spacing := 4
+    ]
+
+  prefsPathEntry <- new Gtk.Entry
+    [ #placeholderText := "/path/to/Mods"
+    , #text := T.pack (wsModPath state)
+    , #hexpand := True
+    ]
+  Gtk.widgetAddCssClass prefsPathEntry "monospace"
+
+  prefsBrowseBtn <- new Gtk.Button [#iconName := "folder-open-symbolic"]
+  Gtk.widgetSetTooltipText prefsBrowseBtn (Just "Browse...")
+  Gtk.widgetSetValign prefsBrowseBtn Gtk.AlignCenter
+
+  Gtk.boxAppend prefsEntryBox prefsPathEntry
+  Gtk.boxAppend prefsEntryBox prefsBrowseBtn
+
+  prefsStatusLabel <- new Gtk.Label
+    [ #label := ""
+    , #halign := Gtk.AlignStart
+    , #wrap := True
+    ]
+
+  prefsBtnBox <- new Gtk.Box
+    [ #orientation := Gtk.OrientationHorizontal
+    , #spacing := 8
+    , #halign := Gtk.AlignEnd
+    ]
+
+  resetBtn <- new Gtk.Button [#label := "Reset"]
+  savePrefsBtn <- new Gtk.Button [#label := "Save"]
+  Gtk.widgetAddCssClass savePrefsBtn "suggested-action"
+
+  Gtk.boxAppend prefsBtnBox resetBtn
+  Gtk.boxAppend prefsBtnBox savePrefsBtn
+
+  Gtk.boxAppend prefsBox prefsLabel
+  Gtk.boxAppend prefsBox prefsEntryBox
+  Gtk.boxAppend prefsBox prefsStatusLabel
+  Gtk.boxAppend prefsBox prefsBtnBox
+
+  prefsPopover <- new Gtk.Popover [#child := prefsBox]
+  Gtk.menuButtonSetPopover settingsBtn (Just prefsPopover)
+
   Adw.headerBarPackEnd headerBar settingsBtn
+
+  -- ── Add Mod popover ───────────────────────────────────────────────
+  addModBtn <- new Gtk.MenuButton [#iconName := "list-add-symbolic"]
+  Gtk.widgetSetTooltipText addModBtn (Just "Add Mod")
+
+  popoverBox <- new Gtk.Box
+    [ #orientation := Gtk.OrientationVertical
+    , #spacing := 8
+    , #marginTop := 8
+    , #marginBottom := 8
+    , #marginStart := 8
+    , #marginEnd := 8
+    ]
+  Gtk.widgetSetSizeRequest popoverBox 400 (-1)
+
+  pathLabel <- new Gtk.Label
+    [ #label := "Path to .package or .ts4script file:"
+    , #halign := Gtk.AlignStart
+    ]
+
+  addEntryBox <- new Gtk.Box
+    [ #orientation := Gtk.OrientationHorizontal
+    , #spacing := 4
+    ]
+
+  pathEntry <- new Gtk.Entry
+    [ #placeholderText := "/path/to/mod.package"
+    , #hexpand := True
+    ]
+  Gtk.widgetAddCssClass pathEntry "monospace"
+
+  addBrowseBtn <- new Gtk.Button [#iconName := "folder-open-symbolic"]
+  Gtk.widgetSetTooltipText addBrowseBtn (Just "Browse...")
+  Gtk.widgetSetValign addBrowseBtn Gtk.AlignCenter
+
+  Gtk.boxAppend addEntryBox pathEntry
+  Gtk.boxAppend addEntryBox addBrowseBtn
+
+  statusLabel <- new Gtk.Label
+    [ #label := ""
+    , #halign := Gtk.AlignStart
+    , #wrap := True
+    ]
+
+  confirmBtn <- new Gtk.Button
+    [ #label := "Add Mod"
+    , #halign := Gtk.AlignEnd
+    ]
+  Gtk.widgetAddCssClass confirmBtn "suggested-action"
+
+  Gtk.boxAppend popoverBox pathLabel
+  Gtk.boxAppend popoverBox addEntryBox
+  Gtk.boxAppend popoverBox statusLabel
+  Gtk.boxAppend popoverBox confirmBtn
+
+  addPopover <- new Gtk.Popover [#child := popoverBox]
+  Gtk.menuButtonSetPopover addModBtn (Just addPopover)
+
+  Adw.headerBarPackEnd headerBar addModBtn
 
   Gtk.boxAppend outerBox headerBar
 
@@ -213,7 +217,6 @@ onActivate app = do
     , #child := listBox
     ]
 
-  -- Wrap the list in a clamp for nice Adwaita styling
   leftBox <- new Gtk.Box
     [ #orientation := Gtk.OrientationVertical
     , #marginTop := 6
@@ -296,83 +299,89 @@ onActivate app = do
         curState <- readIORef stateRef
         newMods <- scanModsFrom (wsModPath curState)
         writeIORef modsRef newMods
-        -- Clear listbox
         let clearList = do
               child <- Gtk.widgetGetFirstChild listBox
               case child of
                 Nothing -> return ()
                 Just c  -> Gtk.listBoxRemove listBox c >> clearList
         clearList
-        -- Re-populate
         mapM_ (addModRow listBox) newMods
         Adw.windowTitleSetSubtitle winTitle
           (T.pack (show (length newMods)) <> " mods found")
 
-  -- Settings button opens preferences
-  _ <- on settingsBtn #clicked $ do
-    curState <- readIORef stateRef
-    prefsDlg <- new Adw.PreferencesDialog
-      [ #title := "Preferences"
-      ]
+  -- ── Add Mod: browse button opens native file picker ───────────────
+  _ <- on addBrowseBtn #clicked $ do
+    fileDialog <- new Gtk.FileDialog [#title := "Select Mod File"]
 
-    page <- new Adw.PreferencesPage []
-    Gtk.widgetAddCssClass prefsDlg "prefs-bordered"
+    modFilter <- new Gtk.FileFilter [#name := "Sims 4 Mods (*.package, *.ts4script)"]
+    Gtk.fileFilterAddPattern modFilter "*.package"
+    Gtk.fileFilterAddPattern modFilter "*.ts4script"
+    fileFilterType <- glibType @Gtk.FileFilter
+    filters <- Gio.listStoreNew fileFilterType
+    Gio.listStoreAppend filters modFilter
+    Gtk.fileDialogSetFilters fileDialog (Just filters)
+    Gtk.fileDialogSetDefaultFilter fileDialog (Just modFilter)
 
-    group <- new Adw.PreferencesGroup
-      [ #title := "Mod Location"
-      , #description := "Set a custom folder or leave empty for default Sims 4 directories"
-      ]
+    Gtk.fileDialogOpen fileDialog (Just win) (Nothing @Gio.Cancellable) (Just $ \_obj res -> do
+      result <- (do
+        file <- Gtk.fileDialogOpenFinish fileDialog res
+        Gio.fileGetPath file
+        ) `catch` (\(_ :: SomeException) -> return Nothing)
+      case result of
+        Nothing -> return ()
+        Just path -> Gtk.editableSetText pathEntry (T.pack path)
+      )
 
-    let curPath = wsModPath curState
+  -- Add Mod: confirm button
+  _ <- on confirmBtn #clicked $ do
+    filePath <- T.unpack . T.strip <$> Gtk.editableGetText pathEntry
+    if null filePath
+      then set statusLabel [#label := "Please enter a file path."]
+      else do
+        result <- validateModFile filePath
+        case result of
+          Left err -> set statusLabel [#label := err]
+          Right validPath -> do
+            curState <- readIORef stateRef
+            modsDir <- getModsFolder (wsModPath curState)
+            _ <- copyModToFolder validPath modsDir
+            rescanMods
+            Gtk.editableSetText pathEntry ("" :: Text)
+            set statusLabel [#label := "Added!"]
+            Gtk.popoverPopdown addPopover
 
-    pathEntry <- new Adw.EntryRow
-      [ #title := "Mods Folder"
-      , #text := T.pack curPath
-      ]
-    Gtk.widgetAddCssClass pathEntry "monospace"
+  -- ── Preferences: browse button opens native folder picker ─────────
+  _ <- on prefsBrowseBtn #clicked $ do
+    folderDialog <- new Gtk.FileDialog [#title := "Select Mods Folder"]
 
-    -- Open current mods folder in file manager
-    openBtn <- new Gtk.Button [#iconName := "folder-open-symbolic"]
-    Gtk.widgetSetValign openBtn Gtk.AlignCenter
-    Gtk.widgetSetTooltipText openBtn (Just "Open in file manager")
-    Adw.entryRowAddSuffix pathEntry openBtn
+    Gtk.fileDialogSelectFolder folderDialog (Just win) (Nothing @Gio.Cancellable) (Just $ \_obj res -> do
+      result <- (do
+        file <- Gtk.fileDialogSelectFolderFinish folderDialog res
+        Gio.fileGetPath file
+        ) `catch` (\(_ :: SomeException) -> return Nothing)
+      case result of
+        Nothing -> return ()
+        Just path -> Gtk.editableSetText prefsPathEntry (T.pack path)
+      )
 
-    -- Reset to default
-    resetBtn <- new Gtk.Button [#iconName := "edit-clear-symbolic"]
-    Gtk.widgetSetValign resetBtn Gtk.AlignCenter
-    Gtk.widgetSetTooltipText resetBtn (Just "Reset to default")
-    Adw.entryRowAddSuffix pathEntry resetBtn
+  -- Preferences: Reset button
+  _ <- on resetBtn #clicked $ do
+    Gtk.editableSetText prefsPathEntry ("" :: Text)
+    set prefsStatusLabel [#label := ""]
 
-    _ <- on openBtn #clicked $ do
-      entryText <- T.unpack <$> get pathEntry #text
-      targetPath <- if null entryText
-        then do
-          home <- getHomeDirectory
-          let p1 = home </> "Documents" </> "Electronic Arts" </> "The Sims 4" </> "Mods"
-          exists <- doesDirectoryExist p1
-          if exists then return p1
-            else return (home </> ".local" </> "share" </> "The Sims 4" </> "Mods")
-        else return entryText
-      file <- Gio.fileNewForPath targetPath
-      uri <- Gio.fileGetUri file
-      launcher <- new Gtk.UriLauncher [#uri := uri]
-      Gtk.uriLauncherLaunch launcher (Just win) (Nothing @Gio.Cancellable) Nothing
-
-    _ <- on resetBtn #clicked $
-      set pathEntry [#text := ("" :: Text)]
-
-    Adw.preferencesGroupAdd group pathEntry
-    Adw.preferencesPageAdd page group
-    Adw.preferencesDialogAdd prefsDlg page
-
-    _ <- on prefsDlg #closed $ do
-      newPath <- T.unpack <$> get pathEntry #text
-      modifyIORef stateRef (\s -> s { wsModPath = newPath })
-      st <- readIORef stateRef
-      saveWindowState configPath st
-      rescanMods
-
-    Adw.dialogPresent prefsDlg (Just win)
+  -- Preferences: Save button
+  _ <- on savePrefsBtn #clicked $ do
+    newPath <- T.unpack . T.strip <$> Gtk.editableGetText prefsPathEntry
+    result <- validateModsFolder newPath
+    case result of
+      Left err -> set prefsStatusLabel [#label := err]
+      Right validPath -> do
+        modifyIORef stateRef (\s -> s { wsModPath = validPath })
+        st <- readIORef stateRef
+        saveWindowState configPath st
+        rescanMods
+        set prefsStatusLabel [#label := "Saved."]
+        Gtk.popoverPopdown prefsPopover
 
   -- Save window state on close
   _ <- on win #closeRequest $ do
