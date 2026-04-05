@@ -27,14 +27,22 @@ module Logic
   , validateModsFolder
   , validateModFile
   , importMod
+  , importZip
+  , importAny
+  , defaultWinePrefixPaths
+  , runInWinePrefix
   , disableMod
   , enableMod
   , removeMod
   ) where
 
+import Codec.Archive.Zip (toArchive, zEntries, eRelativePath, fromEntry)
 import Control.Exception (SomeException, catch)
+import System.Environment (getEnvironment)
+import System.Process (createProcess, proc, CreateProcess(..))
 import Data.Bits ((.&.), shiftL, (.|.))
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BL
 import qualified Data.List as List
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -44,6 +52,7 @@ import System.Directory
   , createDirectoryIfMissing
   , doesDirectoryExist
   , doesFileExist
+  , findExecutable
   , getFileSize
   , getHomeDirectory
   , getXdgDirectory
@@ -76,6 +85,8 @@ data WindowState = WindowState
   , wsPanedPosition :: Int
   , wsMaximized :: Bool
   , wsModPath :: String
+  , wsWinePrefix :: String
+  , wsWineExe :: String   -- custom wine binary path/name (empty = auto-detect)
   }
 
 defaultWindowState :: WindowState
@@ -85,6 +96,8 @@ defaultWindowState = WindowState
   , wsPanedPosition = 720
   , wsMaximized = False
   , wsModPath = ""
+  , wsWinePrefix = ""
+  , wsWineExe = ""
   }
 
 stateFilePath :: IO FilePath
@@ -114,6 +127,8 @@ parseWindowState contents = foldl applyPair defaultWindowState pairs
     applyPair ws ("paned-position", val) = ws { wsPanedPosition = readDef (wsPanedPosition ws) val }
     applyPair ws ("maximized", val)      = ws { wsMaximized = val == "true" }
     applyPair ws ("mod-path", val)       = ws { wsModPath = val }
+    applyPair ws ("wine-prefix", val)    = ws { wsWinePrefix = val }
+    applyPair ws ("wine-exe", val)       = ws { wsWineExe = val }
     applyPair ws _                       = ws
     readDef d s = case reads s of
       [(v, "")] -> v
@@ -128,6 +143,8 @@ saveWindowState path ws = do
     , "paned-position=" ++ show (wsPanedPosition ws)
     , "maximized=" ++ if wsMaximized ws then "true" else "false"
     , "mod-path=" ++ wsModPath ws
+    , "wine-prefix=" ++ wsWinePrefix ws
+    , "wine-exe=" ++ wsWineExe ws
     ]
 
 -- | Max recursion depth for mod scanning (prevents runaway traversal).
@@ -623,3 +640,177 @@ enableAllMods mods =
 disableAllMods :: [ModInfo] -> IO ()
 disableAllMods mods =
   mapM_ (disableMod . T.unpack . modPath) (filter modEnabled mods)
+
+-- ---------------------------------------------------------------------------
+-- Zip import
+-- ---------------------------------------------------------------------------
+
+-- | Extract all .package and .ts4script files from a zip into the mods folder.
+-- Returns the imported ModInfo list, or an error message if nothing could be extracted.
+importZip :: FilePath -> String -> IO (Either Text [ModInfo])
+importZip zipPath customModPath = (do
+  modsDir  <- getModsFolder customModPath
+  bytes    <- BL.readFile zipPath
+  let entries = filter (isModEntry . eRelativePath) (zEntries (toArchive bytes))
+  if null entries
+    then return (Left "No .package or .ts4script files found in zip.")
+    else do
+      results <- mapM (extractEntry modsDir) entries
+      let successes = [m | Right m <- results]
+          failures  = [e | Left  e <- results]
+      if null successes
+        then return (Left (T.intercalate "; " failures))
+        else return (Right successes)
+  ) `catch` (\(e :: SomeException) ->
+      return (Left $ "Failed to read zip: " <> T.pack (show e)))
+  where
+    isModEntry path =
+      let ext = takeExtension (takeFileName path)
+      in ext == ".package" || ext == ".ts4script"
+
+    extractEntry modsDir entry = (do
+      let fname    = takeFileName (eRelativePath entry)
+          destPath = modsDir </> fname
+      BL.writeFile destPath (fromEntry entry)
+      size    <- getFileSize destPath
+      let ext = takeExtension fname
+      pkgInfo <- if ext == ".package"
+        then parsePackageFile destPath
+        else return Nothing
+      return $ Right ModInfo
+        { modName        = T.pack fname
+        , modPath        = T.pack destPath
+        , modSize        = size
+        , modType        = T.pack (drop 1 ext)
+        , modPackageInfo = pkgInfo
+        , modEnabled     = True
+        }
+      ) `catch` (\(e :: SomeException) ->
+          return $ Left $ T.pack (takeFileName (eRelativePath entry))
+                        <> ": " <> T.pack (show e))
+
+-- | Import a single mod file or a zip archive, returning all imported mods.
+importAny :: FilePath -> String -> IO (Either Text [ModInfo])
+importAny path customModPath
+  | takeExtension path == ".zip" = importZip path customModPath
+  | otherwise = do
+      result <- importMod path customModPath
+      return $ case result of
+        Left err -> Left err
+        Right m  -> Right [m]
+
+-- ---------------------------------------------------------------------------
+-- Wine prefix / tool launcher
+-- ---------------------------------------------------------------------------
+
+-- | Common Sims 4 Wine prefix locations to check.
+defaultWinePrefixPaths :: IO [FilePath]
+defaultWinePrefixPaths = do
+  home <- getHomeDirectory
+  return
+    [ home </> ".local" </> "share" </> "Steam"
+              </> "steamapps" </> "compatdata" </> "1222670" </> "pfx"
+    , home </> ".wine"
+    ]
+
+-- | Launch an executable under Wine.
+-- @customWineExe@: path or name of the wine binary to use; empty = auto-detect.
+-- On NixOS, wraps the call in @steam-run@ when available so that the Proton
+-- wine binary can find its dynamically linked libraries.
+-- Returns immediately (does not wait for the process to exit).
+runInWinePrefix :: String -> FilePath -> FilePath -> IO (Either Text ())
+runInWinePrefix customWineExe prefix exePath = (do
+  mWine <- resolveWineExe customWineExe
+  case mWine of
+    Nothing -> return (Left
+      "wine not found. Set a Wine executable path in Preferences\
+      \ (e.g. the Proton wine64 inside your Steam installation).")
+    Just wine -> do
+      currentEnv <- getEnvironment
+      let newEnv = ("WINEPREFIX", prefix)
+                   : filter ((/= "WINEPREFIX") . fst) currentEnv
+      mSteamRun <- findSteamRun
+      let (cmd, args) = case mSteamRun of
+            Just sr -> (sr, [wine, exePath])   -- NixOS: steam-run wine64 exe
+            Nothing -> (wine, [exePath])        -- standard Linux: wine64 exe
+      _ <- createProcess (proc cmd args) { env = Just newEnv }
+      return (Right ())
+  ) `catch` (\(e :: SomeException) ->
+      return (Left $ "Failed to launch: " <> T.pack (show e)))
+
+-- | Resolve which wine binary to use.
+-- If @custom@ is non-empty, treat it as a path or executable name.
+-- Otherwise search system PATH, common install dirs, then Proton.
+resolveWineExe :: String -> IO (Maybe FilePath)
+resolveWineExe custom
+  | not (null custom) = do
+      exists <- doesFileExist custom
+      if exists
+        then return (Just custom)
+        else findExecutable custom   -- treat as a name in PATH
+  | otherwise = findWineExecutable
+
+-- | Search for steam-run (NixOS FHS wrapper for Steam binaries).
+findSteamRun :: IO (Maybe FilePath)
+findSteamRun = do
+  viaPath <- findExecutable "steam-run"
+  case viaPath of
+    Just p  -> return (Just p)
+    Nothing -> findFirstExisting
+      [ "/run/current-system/sw/bin/steam-run"
+      , "/nix/var/nix/profiles/default/bin/steam-run"
+      ]
+  where
+    findFirstExisting []     = return Nothing
+    findFirstExisting (p:ps) = doesFileExist p >>= \e ->
+      if e then return (Just p) else findFirstExisting ps
+
+-- | Search for a wine binary: PATH → common install dirs → Steam Proton.
+findWineExecutable :: IO (Maybe FilePath)
+findWineExecutable = do
+  viaPath <- findExecutable "wine"
+  case viaPath of
+    Just p  -> return (Just p)
+    Nothing -> do
+      fromDirs <- findFirstExisting systemPaths
+      case fromDirs of
+        Just p  -> return (Just p)
+        Nothing -> findProtonWine
+  where
+    systemPaths =
+      [ "/usr/bin/wine64", "/usr/bin/wine"
+      , "/usr/local/bin/wine64", "/usr/local/bin/wine"
+      , "/opt/wine-stable/bin/wine64", "/opt/wine-stable/bin/wine"
+      , "/opt/wine-devel/bin/wine64",  "/opt/wine-devel/bin/wine"
+      , "/opt/wine-staging/bin/wine64","/opt/wine-staging/bin/wine"
+      ]
+    findFirstExisting []     = return Nothing
+    findFirstExisting (p:ps) = doesFileExist p >>= \e ->
+      if e then return (Just p) else findFirstExisting ps
+
+-- | Search Steam's Proton installations for a wine64/wine binary.
+-- Handles both the older @dist/bin/@ and newer @files/bin/@ layouts.
+findProtonWine :: IO (Maybe FilePath)
+findProtonWine = do
+  home <- getHomeDirectory
+  let steamCommon = home </> ".local" </> "share" </> "Steam"
+                        </> "steamapps" </> "common"
+  exists <- doesDirectoryExist steamCommon
+  if not exists
+    then return Nothing
+    else do
+      entries <- listDirectory steamCommon
+                   `catch` (\(_ :: SomeException) -> return [])
+      let protonDirs = filter ("Proton" `List.isPrefixOf`) entries
+          candidates = concatMap (\d ->
+            let base = steamCommon </> d
+            in [ base </> "files" </> "bin" </> "wine64"
+               , base </> "files" </> "bin" </> "wine"
+               , base </> "dist"  </> "bin" </> "wine64"
+               , base </> "dist"  </> "bin" </> "wine"
+               ]) protonDirs
+      findFirstExisting candidates
+  where
+    findFirstExisting []     = return Nothing
+    findFirstExisting (p:ps) = doesFileExist p >>= \e ->
+      if e then return (Just p) else findFirstExisting ps

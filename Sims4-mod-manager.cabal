@@ -25,5 +25,7 @@ executable Sims4-mod-manager
                     , directory
                     , filepath
                     , bytestring
+                    , zip-archive
+                    , process
     hs-source-dirs:   app
     default-language: Haskell2010

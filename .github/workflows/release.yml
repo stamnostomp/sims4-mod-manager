@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build
+        run: nix build
+
+      - name: Copy binary
+        run: cp result/bin/Sims4-mod-manager Sims4-mod-manager-linux
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binary
+          path: Sims4-mod-manager-linux
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-ghc
+            mingw-w64-x86_64-cabal-install
+            mingw-w64-x86_64-gtk4
+            mingw-w64-x86_64-libadwaita
+            mingw-w64-x86_64-gobject-introspection
+            mingw-w64-x86_64-pkg-config
+
+      - name: Cache cabal store
+        uses: actions/cache@v4
+        with:
+          path: C:\cabal
+          key: windows-cabal-${{ hashFiles('Sims4-mod-manager.cabal') }}
+          restore-keys: windows-cabal-
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          cabal update
+          cabal build exe:Sims4-mod-manager
+          cp "$(cabal list-bin Sims4-mod-manager)" Sims4-mod-manager.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binary
+          path: Sims4-mod-manager.exe
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-binary
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-binary
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Sims4-mod-manager-linux
+            Sims4-mod-manager.exe
+          generate_release_notes: true

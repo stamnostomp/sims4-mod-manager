@@ -13,8 +13,9 @@ import Data.GI.Base
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.IORef
-import Control.Monad (when, join, forM_)
+import Control.Monad (when, join, forM_, filterM)
 import Control.Exception (SomeException, catch)
+import System.Directory (doesDirectoryExist)
 
 import Logic
 
@@ -110,6 +111,49 @@ onActivate app = do
   prefsStatusLabel <- new Gtk.Label
     [ #label := "", #halign := Gtk.AlignStart, #wrap := True ]
 
+  -- Wine prefix field
+  prefsSep <- new Gtk.Separator [#orientation := Gtk.OrientationHorizontal]
+
+  wineLabel <- new Gtk.Label
+    [ #label := "Wine Prefix (leave empty to auto-detect):", #halign := Gtk.AlignStart ]
+
+  wineEntryBox <- new Gtk.Box
+    [ #orientation := Gtk.OrientationHorizontal, #spacing := 4 ]
+
+  winePrefixEntry <- new Gtk.Entry
+    [ #placeholderText := "/path/to/wine/prefix"
+    , #text := T.pack (wsWinePrefix state)
+    , #hexpand := True
+    ]
+  Gtk.widgetAddCssClass winePrefixEntry "monospace"
+
+  wineBrowseBtn <- new Gtk.Button [#iconName := "folder-open-symbolic"]
+  Gtk.widgetSetTooltipText wineBrowseBtn (Just "Browse...")
+  Gtk.widgetSetValign wineBrowseBtn Gtk.AlignCenter
+
+  Gtk.boxAppend wineEntryBox winePrefixEntry
+  Gtk.boxAppend wineEntryBox wineBrowseBtn
+
+  wineExeLabel <- new Gtk.Label
+    [ #label := "Wine executable (leave empty to auto-detect):", #halign := Gtk.AlignStart ]
+
+  wineExeEntryBox <- new Gtk.Box
+    [ #orientation := Gtk.OrientationHorizontal, #spacing := 4 ]
+
+  wineExeEntry <- new Gtk.Entry
+    [ #placeholderText := "/path/to/wine64  or  wine64"
+    , #text := T.pack (wsWineExe state)
+    , #hexpand := True
+    ]
+  Gtk.widgetAddCssClass wineExeEntry "monospace"
+
+  wineExeBrowseBtn <- new Gtk.Button [#iconName := "folder-open-symbolic"]
+  Gtk.widgetSetTooltipText wineExeBrowseBtn (Just "Browse...")
+  Gtk.widgetSetValign wineExeBrowseBtn Gtk.AlignCenter
+
+  Gtk.boxAppend wineExeEntryBox wineExeEntry
+  Gtk.boxAppend wineExeEntryBox wineExeBrowseBtn
+
   prefsBtnBox <- new Gtk.Box
     [ #orientation := Gtk.OrientationHorizontal, #spacing := 8, #halign := Gtk.AlignEnd ]
 
@@ -123,6 +167,11 @@ onActivate app = do
   Gtk.boxAppend prefsBox prefsLabel
   Gtk.boxAppend prefsBox prefsEntryBox
   Gtk.boxAppend prefsBox prefsStatusLabel
+  Gtk.boxAppend prefsBox prefsSep
+  Gtk.boxAppend prefsBox wineLabel
+  Gtk.boxAppend prefsBox wineEntryBox
+  Gtk.boxAppend prefsBox wineExeLabel
+  Gtk.boxAppend prefsBox wineExeEntryBox
   Gtk.boxAppend prefsBox prefsBtnBox
 
   prefsPopover <- new Gtk.Popover [#child := prefsBox]
@@ -140,13 +189,13 @@ onActivate app = do
   Gtk.widgetSetSizeRequest popoverBox 400 (-1)
 
   pathLabel <- new Gtk.Label
-    [ #label := "Path to .package or .ts4script file:", #halign := Gtk.AlignStart ]
+    [ #label := "Path to .package, .ts4script, or .zip file:", #halign := Gtk.AlignStart ]
 
   addEntryBox <- new Gtk.Box
     [ #orientation := Gtk.OrientationHorizontal, #spacing := 4 ]
 
   pathEntry <- new Gtk.Entry
-    [ #placeholderText := "/path/to/mod.package", #hexpand := True ]
+    [ #placeholderText := "/path/to/mod.package or mod.zip", #hexpand := True ]
   Gtk.widgetAddCssClass pathEntry "monospace"
 
   addBrowseBtn <- new Gtk.Button [#iconName := "folder-open-symbolic"]
@@ -222,6 +271,56 @@ onActivate app = do
   profilesPopover <- new Gtk.Popover [#child := profilesBox]
   Gtk.menuButtonSetPopover profilesBtn (Just profilesPopover)
   Adw.headerBarPackEnd headerBar profilesBtn
+
+  -- ── Run Tool popover ──────────────────────────────────────────────
+  runToolBtn <- new Gtk.MenuButton [#iconName := "system-run-symbolic"]
+  Gtk.widgetSetTooltipText runToolBtn (Just "Run Tool in Wine")
+
+  runToolBox <- new Gtk.Box
+    [ #orientation := Gtk.OrientationVertical, #spacing := 8
+    , #marginTop := 8, #marginBottom := 8, #marginStart := 8, #marginEnd := 8
+    ]
+  Gtk.widgetSetSizeRequest runToolBox 400 (-1)
+
+  runToolTitle <- new Gtk.Label
+    [ #label := "Run Tool in Wine Prefix", #halign := Gtk.AlignStart ]
+  Gtk.widgetAddCssClass runToolTitle "title-4"
+
+  runToolNote <- new Gtk.Label
+    [ #label := "Wine prefix is set in Preferences. The tool will launch using the configured prefix."
+    , #halign := Gtk.AlignStart, #wrap := True
+    ]
+  Gtk.widgetAddCssClass runToolNote "dim-label"
+
+  runToolEntryBox <- new Gtk.Box
+    [ #orientation := Gtk.OrientationHorizontal, #spacing := 4 ]
+
+  runToolEntry <- new Gtk.Entry
+    [ #placeholderText := "/path/to/tool.exe", #hexpand := True ]
+  Gtk.widgetAddCssClass runToolEntry "monospace"
+
+  runToolBrowseBtn <- new Gtk.Button [#iconName := "folder-open-symbolic"]
+  Gtk.widgetSetTooltipText runToolBrowseBtn (Just "Browse...")
+  Gtk.widgetSetValign runToolBrowseBtn Gtk.AlignCenter
+
+  Gtk.boxAppend runToolEntryBox runToolEntry
+  Gtk.boxAppend runToolEntryBox runToolBrowseBtn
+
+  runToolStatusLabel <- new Gtk.Label
+    [ #label := "", #halign := Gtk.AlignStart, #wrap := True ]
+
+  runToolLaunchBtn <- new Gtk.Button [#label := "Launch", #halign := Gtk.AlignEnd]
+  Gtk.widgetAddCssClass runToolLaunchBtn "suggested-action"
+
+  Gtk.boxAppend runToolBox runToolTitle
+  Gtk.boxAppend runToolBox runToolNote
+  Gtk.boxAppend runToolBox runToolEntryBox
+  Gtk.boxAppend runToolBox runToolStatusLabel
+  Gtk.boxAppend runToolBox runToolLaunchBtn
+
+  runToolPopover <- new Gtk.Popover [#child := runToolBox]
+  Gtk.menuButtonSetPopover runToolBtn (Just runToolPopover)
+  Adw.headerBarPackEnd headerBar runToolBtn
 
   Gtk.boxAppend outerBox headerBar
 
@@ -333,13 +432,17 @@ onActivate app = do
   -- ── doImportMod ───────────────────────────────────────────────────
   let doImportMod filePath = do
         curState <- readIORef stateRef
-        result   <- importMod filePath (wsModPath curState)
+        result   <- importAny filePath (wsModPath curState)
         case result of
-          Left err -> set statusLabel [#label := err]
-          Right _  -> do
+          Left err   -> set statusLabel [#label := err]
+          Right mods -> do
             rescanMods
             Gtk.editableSetText pathEntry ("" :: Text)
-            set statusLabel [#label := "Added!"]
+            let n = length mods
+                msg = if n == 1
+                        then "Added 1 mod."
+                        else "Added " <> T.pack (show n) <> " mods from zip."
+            set statusLabel [#label := msg]
             Gtk.popoverPopdown addPopover
 
   -- ── rebuildProfilesList ───────────────────────────────────────────
@@ -458,9 +561,10 @@ onActivate app = do
   -- ── Add Mod: browse ───────────────────────────────────────────────
   _ <- on addBrowseBtn #clicked $ do
     fileDialog <- new Gtk.FileDialog [#title := "Select Mod File"]
-    modFilter  <- new Gtk.FileFilter [#name := "Sims 4 Mods (*.package, *.ts4script)"]
+    modFilter  <- new Gtk.FileFilter [#name := "Sims 4 Mods (*.package, *.ts4script, *.zip)"]
     Gtk.fileFilterAddPattern modFilter "*.package"
     Gtk.fileFilterAddPattern modFilter "*.ts4script"
+    Gtk.fileFilterAddPattern modFilter "*.zip"
     fileFilterType <- glibType @Gtk.FileFilter
     filters <- Gio.listStoreNew fileFilterType
     Gio.listStoreAppend filters modFilter
@@ -496,24 +600,106 @@ onActivate app = do
         Just path -> Gtk.editableSetText prefsPathEntry (T.pack path)
       )
 
+  -- ── Preferences: browse wine prefix ───────────────────────────────
+  _ <- on wineBrowseBtn #clicked $ do
+    folderDialog <- new Gtk.FileDialog [#title := "Select Wine Prefix Folder"]
+    Gtk.fileDialogSelectFolder folderDialog (Just win) (Nothing @Gio.Cancellable) (Just $ \_obj res -> do
+      result <- (do
+        file <- Gtk.fileDialogSelectFolderFinish folderDialog res
+        Gio.fileGetPath file
+        ) `catch` (\(_ :: SomeException) -> return Nothing)
+      case result of
+        Nothing   -> return ()
+        Just path -> Gtk.editableSetText winePrefixEntry (T.pack path)
+      )
+
+  -- ── Preferences: browse wine exe ──────────────────────────────────
+  _ <- on wineExeBrowseBtn #clicked $ do
+    fileDialog <- new Gtk.FileDialog [#title := "Select Wine Executable"]
+    Gtk.fileDialogOpen fileDialog (Just win) (Nothing @Gio.Cancellable) (Just $ \_obj res -> do
+      result <- (do
+        file <- Gtk.fileDialogOpenFinish fileDialog res
+        Gio.fileGetPath file
+        ) `catch` (\(_ :: SomeException) -> return Nothing)
+      case result of
+        Nothing   -> return ()
+        Just path -> Gtk.editableSetText wineExeEntry (T.pack path)
+      )
+
   -- ── Preferences: reset ────────────────────────────────────────────
   _ <- on resetBtn #clicked $ do
     Gtk.editableSetText prefsPathEntry ("" :: Text)
+    Gtk.editableSetText winePrefixEntry ("" :: Text)
+    Gtk.editableSetText wineExeEntry ("" :: Text)
     set prefsStatusLabel [#label := ""]
 
   -- ── Preferences: save ─────────────────────────────────────────────
   _ <- on savePrefsBtn #clicked $ do
-    newPath <- T.unpack . T.strip <$> Gtk.editableGetText prefsPathEntry
-    result  <- validateModsFolder newPath
+    newPath    <- T.unpack . T.strip <$> Gtk.editableGetText prefsPathEntry
+    newPrefix  <- T.unpack . T.strip <$> Gtk.editableGetText winePrefixEntry
+    newWineExe <- T.unpack . T.strip <$> Gtk.editableGetText wineExeEntry
+    result     <- validateModsFolder newPath
     case result of
       Left err        -> set prefsStatusLabel [#label := err]
       Right validPath -> do
-        modifyIORef stateRef (\s -> s { wsModPath = validPath })
+        modifyIORef stateRef (\s -> s
+          { wsModPath    = validPath
+          , wsWinePrefix = newPrefix
+          , wsWineExe    = newWineExe
+          })
         st <- readIORef stateRef
         saveWindowState configPath st
         rescanMods
         set prefsStatusLabel [#label := "Saved."]
         Gtk.popoverPopdown prefsPopover
+
+  -- ── Run Tool: browse .exe ─────────────────────────────────────────
+  _ <- on runToolBrowseBtn #clicked $ do
+    fileDialog <- new Gtk.FileDialog [#title := "Select Executable"]
+    exeFilter  <- new Gtk.FileFilter [#name := "Windows Executables (*.exe)"]
+    Gtk.fileFilterAddPattern exeFilter "*.exe"
+    allFilter  <- new Gtk.FileFilter [#name := "All Files (*)"]
+    Gtk.fileFilterAddPattern allFilter "*"
+    fileFilterType <- glibType @Gtk.FileFilter
+    filters <- Gio.listStoreNew fileFilterType
+    Gio.listStoreAppend filters exeFilter
+    Gio.listStoreAppend filters allFilter
+    Gtk.fileDialogSetFilters fileDialog (Just filters)
+    Gtk.fileDialogSetDefaultFilter fileDialog (Just exeFilter)
+    Gtk.fileDialogOpen fileDialog (Just win) (Nothing @Gio.Cancellable) (Just $ \_obj res -> do
+      result <- (do
+        file <- Gtk.fileDialogOpenFinish fileDialog res
+        Gio.fileGetPath file
+        ) `catch` (\(_ :: SomeException) -> return Nothing)
+      case result of
+        Nothing   -> return ()
+        Just path -> Gtk.editableSetText runToolEntry (T.pack path)
+      )
+
+  -- ── Run Tool: launch ──────────────────────────────────────────────
+  _ <- on runToolLaunchBtn #clicked $ do
+    exePath <- T.unpack . T.strip <$> Gtk.editableGetText runToolEntry
+    if null exePath
+      then set runToolStatusLabel [#label := "Please enter a path to an executable."]
+      else do
+        curState <- readIORef stateRef
+        prefix   <- if null (wsWinePrefix curState)
+          then do
+            defaults <- defaultWinePrefixPaths
+            existing <- filterM doesDirectoryExist defaults
+            return $ case existing of
+              (p:_) -> p
+              []    -> ""
+          else return (wsWinePrefix curState)
+        if null prefix
+          then set runToolStatusLabel [#label := "No Wine prefix found. Set one in Preferences."]
+          else do
+            result <- runInWinePrefix (wsWineExe curState) prefix exePath
+            case result of
+              Left err -> set runToolStatusLabel [#label := err]
+              Right () -> do
+                set runToolStatusLabel [#label := "Launched."]
+                Gtk.popoverPopdown runToolPopover
 
   -- ── Save window state on close ────────────────────────────────────
   _ <- on win #closeRequest $ do

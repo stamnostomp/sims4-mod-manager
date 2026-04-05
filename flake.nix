@@ -9,7 +9,32 @@
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
+
+      sims4-mod-manager = (pkgs.haskellPackages.callCabal2nix "Sims4-mod-manager" ./. {}).overrideAttrs (old: {
+        nativeBuildInputs = (old.nativeBuildInputs or []) ++ [
+          pkgs.pkg-config
+          pkgs.wrapGAppsHook4
+          pkgs.gobject-introspection
+        ];
+        buildInputs = (old.buildInputs or []) ++ [
+          pkgs.gtk4
+          pkgs.libadwaita
+          pkgs.gsettings-desktop-schemas
+          pkgs.shared-mime-info
+          pkgs.hicolor-icon-theme
+        ];
+      });
     in {
+      packages.${system} = {
+        default = sims4-mod-manager;
+        sims4-mod-manager = sims4-mod-manager;
+      };
+
+      apps.${system}.default = {
+        type = "app";
+        program = "${sims4-mod-manager}/bin/Sims4-mod-manager";
+      };
+
       devShells.${system}.default = pkgs.mkShell {
         buildInputs = with pkgs; [
           (haskellPackages.ghcWithPackages (ps: with ps; [
@@ -17,6 +42,7 @@
             gi-gio
             gi-gtk
             haskell-gi-base
+            zip-archive
           ]))
           cabal-install
           pkg-config
