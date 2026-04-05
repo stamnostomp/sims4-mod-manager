@@ -4,11 +4,19 @@
 module Logic
   ( ModInfo(..)
   , PackageInfo(..)
+  , ModProfile(..)
   , WindowState(..)
   , defaultWindowState
   , stateFilePath
   , loadWindowState
   , saveWindowState
+  , profilesFilePath
+  , loadProfiles
+  , saveProfiles
+  , makeProfileFromCurrent
+  , applyProfile
+  , enableAllMods
+  , disableAllMods
   , findMods
   , scanMods
   , scanModsFrom
@@ -19,6 +27,9 @@ module Logic
   , validateModsFolder
   , validateModFile
   , importMod
+  , disableMod
+  , enableMod
+  , removeMod
   ) where
 
 import Control.Exception (SomeException, catch)
@@ -37,9 +48,11 @@ import System.Directory
   , getHomeDirectory
   , getXdgDirectory
   , listDirectory
+  , removeFile
+  , renameFile
   , XdgDirectory(..)
   )
-import System.FilePath ((</>), takeDirectory, takeExtension, takeFileName)
+import System.FilePath ((</>), takeDirectory, takeExtension, takeFileName, dropExtension)
 
 data PackageInfo = PackageInfo
   { pkgVersion       :: (Int, Int)      -- DBPF major.minor
@@ -54,6 +67,7 @@ data ModInfo = ModInfo
   , modSize        :: Integer
   , modType        :: Text
   , modPackageInfo :: Maybe PackageInfo
+  , modEnabled     :: Bool
   }
 
 data WindowState = WindowState
@@ -139,8 +153,8 @@ findMods root = do
       isDir <- doesDirectoryExist full
       if isDir
         then go (depth + 1) full
-        else case takeExtension entry of
-          ext | ext == ".package" || ext == ".ts4script" -> do
+        else case classifyMod entry of
+          Just (ext, enabled) -> do
             size <- getFileSize full `catch` (\(_ :: SomeException) -> return 0)
             pkgInfo <- if ext == ".package"
               then parsePackageFile full
@@ -152,9 +166,24 @@ findMods root = do
                   , modSize = size
                   , modType = T.pack (drop 1 ext)
                   , modPackageInfo = pkgInfo
+                  , modEnabled = enabled
                   }
               ]
-          _ -> return []
+          Nothing -> return []
+
+    -- | Classify a filename as a mod.  Returns the base extension and
+    -- whether it is enabled.
+    classifyMod :: FilePath -> Maybe (String, Bool)
+    classifyMod name
+      | takeExtension name == ".package"   = Just (".package", True)
+      | takeExtension name == ".ts4script" = Just (".ts4script", True)
+      | takeExtension name == ".disabled"  =
+          let base = dropExtension name
+              baseExt = takeExtension base
+          in if baseExt == ".package" || baseExt == ".ts4script"
+               then Just (baseExt, False)
+               else Nothing
+      | otherwise = Nothing
 
 -- | Format a file size for display.
 formatSize :: Integer -> Text
@@ -220,6 +249,7 @@ copyModToFolder srcFile modsDir = do
     , modSize = size
     , modType = T.pack (drop 1 ext)
     , modPackageInfo = pkgInfo
+    , modEnabled = True
     }
 
 -- | Validate a mods folder path. Returns Right path if valid, Left error if not.
@@ -260,6 +290,32 @@ importMod filePath customModPath = do
       modInfo <- copyModToFolder validPath modsDir
       return (Right modInfo)
 
+-- | Disable a mod by appending ".disabled" to its filename.
+disableMod :: FilePath -> IO (Either Text FilePath)
+disableMod path = do
+  let newPath = path ++ ".disabled"
+  (renameFile path newPath >> return (Right newPath))
+    `catch` (\(e :: SomeException) ->
+      return (Left $ "Failed to disable mod: " <> T.pack (show e)))
+
+-- | Enable a mod by removing the trailing ".disabled" from its filename.
+enableMod :: FilePath -> IO (Either Text FilePath)
+enableMod path
+  | takeExtension path /= ".disabled" =
+      return (Left "File is not disabled.")
+  | otherwise = do
+      let newPath = dropExtension path
+      (renameFile path newPath >> return (Right newPath))
+        `catch` (\(e :: SomeException) ->
+          return (Left $ "Failed to enable mod: " <> T.pack (show e)))
+
+-- | Remove a mod by deleting its file.
+removeMod :: FilePath -> IO (Either Text ())
+removeMod path = do
+  (removeFile path >> return (Right ()))
+    `catch` (\(e :: SomeException) ->
+      return (Left $ "Failed to remove mod: " <> T.pack (show e)))
+
 -- ---------------------------------------------------------------------------
 -- DBPF (.package) parsing
 -- ---------------------------------------------------------------------------
@@ -291,8 +347,15 @@ parsePackageFile path = (do
           -- Parse index entries to extract type IDs
           typeIds <- parseIndex bs indexPos indexCount
           let grouped   = countTypes typeIds
-              named     = map (\(tid, cnt) -> (resourceTypeName tid, cnt)) grouped
-              sorted    = List.sortBy (\a b' -> compare (snd b') (snd a)) named
+              -- Map to human names, grouping unknowns as "Other"
+              (known, unknownCount) = foldr (\(tid, cnt) (ks, uc) ->
+                case resourceTypeName tid of
+                  Just name -> ((name, cnt) : ks, uc)
+                  Nothing   -> (ks, uc + cnt)) ([], 0 :: Int) grouped
+              withOther = if unknownCount > 0
+                then known ++ [("Other", unknownCount)]
+                else known
+              sorted    = List.sortBy (\a b' -> compare (snd b') (snd a)) withOther
               category  = inferCategory (map fst grouped)
 
           return $ Just PackageInfo
@@ -362,46 +425,114 @@ countTypes = foldr (\g acc -> case g of
   []    -> acc) [] . List.group . List.sort
 
 -- | Map a DBPF resource Type ID to a human-readable name.
-resourceTypeName :: Word32 -> Text
+-- Returns Nothing for unknown types (grouped as "Other" in display).
+resourceTypeName :: Word32 -> Maybe Text
 resourceTypeName tid = case tid of
-  0x220557DA -> "String Table"
-  0x034AEECB -> "CAS Part"
-  0x015A1849 -> "Geometry"
-  0x00B2D882 -> "Mesh"
-  0x3453CF95 -> "DST Texture"
-  0x00AE6C67 -> "Bone Delta"
-  0xC0DB5AE7 -> "Object Definition"
-  0x545AC67A -> "Object Catalog"
-  0x0333406C -> "XML Tuning"
-  0x62ECC59A -> "Animation (CLIP)"
-  0xA8D58BE5 -> "Jazz State Machine"
-  0xD3044521 -> "Region Map"
-  0x0166038C -> "Texture Compositor"
-  0xB61DE6B4 -> "Texture (DDS)"
-  0x2F7D0004 -> "Thumbnail"
-  0xD382BF57 -> "Lot Tuning"
-  0x6B20C4F3 -> "Swatch"
-  _          -> "0x" <> T.pack (showHexWord32 tid)
-
--- | Show a Word32 as an 8-digit uppercase hex string.
-showHexWord32 :: Word32 -> String
-showHexWord32 w = go 8 w ""
-  where
-    go 0 _ acc = acc
-    go n v acc =
-      let (q, r) = v `divMod` 16
-          c = "0123456789ABCDEF" !! fromIntegral r
-      in go (n - 1 :: Int) q (c : acc)
+  -- Images / Textures
+  0x00B2D882 -> Just "DDS Image"
+  0xB6C8B6A0 -> Just "DDS Image"
+  0x3453CF95 -> Just "DXT5 Image"
+  0xBA856C78 -> Just "DXT5 RLES Image"
+  0x3C1AF1F2 -> Just "CAS Thumbnail"
+  0x3C2A8647 -> Just "Object Thumbnail"
+  0x5B282D45 -> Just "Thumbnail"
+  0xCD9DE247 -> Just "Thumbnail PNG"
+  0x0D338A3A -> Just "Lot Preview"
+  0x2F7D0004 -> Just "Background Blend"
+  -- CAS / Sim
+  0x034AEECB -> Just "CAS Part"
+  0x015A1849 -> Just "CAS Geometry"
+  0x0354796A -> Just "Skin Tone"
+  0x71BDB8A2 -> Just "Styled Look"
+  0x025ED6F4 -> Just "Sim Outfit"
+  0x0355E0A6 -> Just "Bone Delta"
+  0xDB43E069 -> Just "Deformer Map"
+  0x8EAF13DE -> Just "Skeleton/Rig"
+  0x067CAA11 -> Just "Blend Geometry"
+  -- Objects / Catalog
+  0xC0DB5AE7 -> Just "Object Definition"
+  0x319E4F1D -> Just "Object Catalog"
+  0x01661233 -> Just "Object Model"
+  0x01D10F34 -> Just "Model LODs"
+  0x01D0E75D -> Just "Material Definition"
+  0x02019972 -> Just "Material State"
+  0x4F726BBE -> Just "Object Footprint"
+  0xB734E44F -> Just "Footprint Resource"
+  0xD3044521 -> Just "Object Slots"
+  0xE231B3D8 -> Just "Object Modifiers"
+  0xD382BF57 -> Just "Footprint Scene"
+  0x03B4C61D -> Just "Light/Occluder"
+  -- Build/Buy Catalog
+  0xB4F762C9 -> Just "Floor Catalog"
+  0xD5F0F921 -> Just "Wallpaper Catalog"
+  0x91EDBD3E -> Just "Roof Style Catalog"
+  0x9A20CD1C -> Just "Stairs Catalog"
+  0x0418FE2A -> Just "Fence Catalog"
+  0x1C1CF1F7 -> Just "Railing Catalog"
+  0x1D6DF1CF -> Just "Column Catalog"
+  0x2FAE983E -> Just "Foundation Catalog"
+  0x3F0C529A -> Just "Spandrel Catalog"
+  0x76BCF80C -> Just "Trim Catalog"
+  0xA057811C -> Just "Frieze Catalog"
+  0xEBCBB16C -> Just "Terrain Paint Catalog"
+  0x84C23219 -> Just "Floor Trim Catalog"
+  -- Tuning / Data
+  0x545AC67A -> Just "SimData"
+  0x62E94D38 -> Just "Combined Tuning"
+  0xB61DE6B4 -> Just "Object Tuning"
+  0x6017E896 -> Just "Buff Tuning"
+  0xCB5FDDC7 -> Just "Trait Tuning"
+  0xE882D22F -> Just "Interaction Tuning"
+  0x0C772E27 -> Just "Action Tuning"
+  0x220557DA -> Just "String Table"
+  -- Animation / Audio
+  0x6B20C4F3 -> Just "Animation Clip"
+  0xBC4A5044 -> Just "Clip Header"
+  0x02D5DF13 -> Just "Animation Sequence"
+  0x033260E3 -> Just "Animation Trackmask"
+  0x01EEF63A -> Just "Audio"
+  0x01A527DB -> Just "Voice Audio"
+  0xBDD82221 -> Just "Audio Event"
+  0xFD04E3BE -> Just "Audio Stinger"
+  0x1B25A024 -> Just "Sound Properties"
+  -- UI / Misc
+  0x62ECC59A -> Just "Scaleform GFX"
+  0x25796DCA -> Just "OpenType Font"
+  0x276CA4B9 -> Just "TrueType Font"
+  0x0333406C -> Just "Font Config"
+  0x376840D7 -> Just "Video"
+  0xEA5118B0 -> Just "Effects"
+  0x2A8A5E22 -> Just "Tray Item"
+  -- World / Lot
+  0x370EFD6E -> Just "Room Definition"
+  0x3924DE26 -> Just "Blueprint"
+  0x91568FD8 -> Just "Lot Object List"
+  0xAC16FBEC -> Just "Region Map"
+  0x9063660D -> Just "World Texture Map"
+  0x3BD45407 -> Just "Household Info"
+  _          -> Nothing
 
 -- | Infer a mod category from the resource types present.
 inferCategory :: [Word32] -> Text
 inferCategory typeIds
-  | 0x034AEECB `elem` typeIds = "Custom Content"    -- CAS Part
-  | 0xA8D58BE5 `elem` typeIds = "Animation Mod"     -- Jazz State Machine
-  | 0x62ECC59A `elem` typeIds = "Animation Mod"     -- CLIP
-  | 0x0333406C `elem` typeIds = "Tuning Mod"        -- XML Tuning
-  | 0xC0DB5AE7 `elem` typeIds = "Object Mod"        -- Object Definition
-  | otherwise                  = "Mod Package"
+  | 0x034AEECB `elem` typeIds                  = "CAS / Clothing & Hair"  -- CAS Part
+  | 0x0354796A `elem` typeIds
+    || 0xDB43E069 `elem` typeIds               = "CAS / Skin"             -- Skin Tone / Deformer Map
+  | any (`elem` typeIds) buildBuyTypes         = "Build / Buy"
+  | 0x6B20C4F3 `elem` typeIds
+    || 0xBC4A5044 `elem` typeIds               = "Animation Mod"
+  | any (`elem` typeIds) tuningTypes           = "Gameplay / Tuning"
+  | 0xC0DB5AE7 `elem` typeIds                  = "Object Mod"
+  | any (`elem` typeIds) worldTypes            = "World / Lot"
+  | otherwise                                  = "Mod Package"
+  where
+    buildBuyTypes = [ 0xB4F762C9, 0xD5F0F921, 0x91EDBD3E, 0x9A20CD1C
+                    , 0x0418FE2A, 0x1C1CF1F7, 0x1D6DF1CF, 0x2FAE983E
+                    , 0x3F0C529A, 0x76BCF80C, 0x84C23219 ]
+    tuningTypes   = [ 0x6017E896, 0xCB5FDDC7, 0xE882D22F, 0x0C772E27
+                    , 0x62E94D38, 0xB61DE6B4 ]
+    worldTypes    = [ 0x370EFD6E, 0x3924DE26, 0x91568FD8, 0xAC16FBEC
+                    , 0x3BD45407 ]
 
 -- | Format PackageInfo as display text for the details panel.
 formatPackageInfo :: PackageInfo -> Text
@@ -413,3 +544,82 @@ formatPackageInfo info =
         | (name, cnt) <- pkgResourceTypes info
         ]
   in catLine <> "\n" <> countLine <> "\n" <> typesLine
+
+-- ---------------------------------------------------------------------------
+-- Mod Profiles
+-- ---------------------------------------------------------------------------
+
+-- | A named snapshot of which mods are enabled.
+data ModProfile = ModProfile
+  { profileName        :: Text
+  , profileEnabledMods :: [Text]  -- filenames of mods that should be enabled
+  } deriving (Show, Eq)
+
+profilesFilePath :: IO FilePath
+profilesFilePath = do
+  configDir <- getXdgDirectory XdgConfig "sims4-mod-manager"
+  return $ configDir </> "profiles.conf"
+
+-- | Save profiles. Format: "[Name]\nfile1.package\nfile2.package\n\n"
+saveProfiles :: FilePath -> [ModProfile] -> IO ()
+saveProfiles path profs = do
+  createDirectoryIfMissing True (takeDirectory path)
+  writeFile path (concatMap fmtProf profs)
+  where
+    fmtProf p =
+      "[" ++ T.unpack (profileName p) ++ "]\n"
+      ++ unlines (map T.unpack (profileEnabledMods p))
+      ++ "\n"
+
+loadProfiles :: FilePath -> IO [ModProfile]
+loadProfiles path = do
+  exists <- doesFileExist path
+  if not exists
+    then return []
+    else parseProfiles <$> readFile path
+
+parseProfiles :: String -> [ModProfile]
+parseProfiles = finish . foldl step (Nothing, []) . lines
+  where
+    step (Nothing, acc) l
+      | isHdr l   = (Just (hdrName l, []), acc)
+      | otherwise = (Nothing, acc)
+    step (Just (n, ms), acc) l
+      | isHdr l        = (Just (hdrName l, []), mkProf n ms : acc)
+      | null (trimS l) = (Just (n, ms), acc)
+      | otherwise      = (Just (n, T.pack (trimS l) : ms), acc)
+    finish (Nothing, acc)      = reverse acc
+    finish (Just (n, ms), acc) = reverse (mkProf n ms : acc)
+    mkProf n ms  = ModProfile n (reverse ms)
+    isHdr l      = case l of { '[':_ -> last l == ']'; _ -> False }
+    hdrName l    = T.pack (drop 1 (init l))
+    trimS        = reverse . dropWhile (== ' ') . reverse . dropWhile (== ' ')
+
+-- | Build a profile from the current enabled/disabled state of all mods.
+makeProfileFromCurrent :: Text -> [ModInfo] -> ModProfile
+makeProfileFromCurrent name mods = ModProfile
+  { profileName        = name
+  , profileEnabledMods = [modName m | m <- mods, modEnabled m]
+  }
+
+-- | Enable/disable mods to match a saved profile.
+applyProfile :: ModProfile -> [ModInfo] -> IO ()
+applyProfile profile mods = mapM_ go mods
+  where
+    enabledSet = profileEnabledMods profile
+    go m = do
+      let path = T.unpack (modPath m)
+      case (modName m `elem` enabledSet, modEnabled m) of
+        (True,  False) -> enableMod  path >> return ()
+        (False, True)  -> disableMod path >> return ()
+        _              -> return ()
+
+-- | Enable all currently disabled mods.
+enableAllMods :: [ModInfo] -> IO ()
+enableAllMods mods =
+  mapM_ (enableMod . T.unpack . modPath) (filter (not . modEnabled) mods)
+
+-- | Disable all currently enabled mods.
+disableAllMods :: [ModInfo] -> IO ()
+disableAllMods mods =
+  mapM_ (disableMod . T.unpack . modPath) (filter modEnabled mods)
