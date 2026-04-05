@@ -11,33 +11,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-4-dev \
-            libadwaita-1-dev \
-            gobject-introspection \
-            libgirepository1.0-dev \
-            pkg-config
-
-      - uses: haskell-actions/setup@v2
+      - uses: cachix/install-nix-action@v27
         with:
-          ghc-version: '9.10'
-          cabal-version: 'latest'
+          extra_nix_config: |
+            experimental-features = nix-command flakes
 
-      - name: Cache cabal store
-        uses: actions/cache@v4
-        with:
-          path: ~/.cabal/store
-          key: linux-cabal-${{ hashFiles('Sims4-mod-manager.cabal') }}
-          restore-keys: linux-cabal-
-
-      - name: Build
+      - name: Build and bundle
         run: |
-          cabal update
-          cabal build exe:Sims4-mod-manager
-          cp "$(cabal list-bin Sims4-mod-manager)" Sims4-mod-manager-linux
+          nix bundle --bundler github:NixOS/bundlers#toAppImage . -o Sims4-mod-manager-linux
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
