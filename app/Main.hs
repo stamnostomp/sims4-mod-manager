@@ -306,17 +306,74 @@ onActivate app = do
   Gtk.boxAppend runToolEntryBox runToolEntry
   Gtk.boxAppend runToolEntryBox runToolBrowseBtn
 
-  runToolStatusLabel <- new Gtk.Label
-    [ #label := "", #halign := Gtk.AlignStart, #wrap := True ]
-
   runToolLaunchBtn <- new Gtk.Button [#label := "Launch", #halign := Gtk.AlignEnd]
   Gtk.widgetAddCssClass runToolLaunchBtn "suggested-action"
+
+  runToolSep <- new Gtk.Separator [#orientation := Gtk.OrientationHorizontal]
+
+  runToolToolsTitle <- new Gtk.Label
+    [ #label := "Wine prefix tools", #halign := Gtk.AlignStart ]
+  Gtk.widgetAddCssClass runToolToolsTitle "title-4"
+
+  runToolWinecfgBtn <- new Gtk.Button [#label := "Open winecfg..."]
+  Gtk.widgetSetTooltipText runToolWinecfgBtn
+    (Just "Open the Wine configuration for this prefix (e.g. to manage DLL overrides).")
+
+  runToolOverrideBox <- new Gtk.Box
+    [ #orientation := Gtk.OrientationHorizontal, #spacing := 4 ]
+
+  runToolDllEntry <- new Gtk.Entry
+    [ #placeholderText := "dll (e.g. version)", #hexpand := True ]
+  Gtk.widgetAddCssClass runToolDllEntry "monospace"
+
+  runToolModeEntry <- new Gtk.Entry
+    [ #placeholderText := "native,builtin", #hexpand := True ]
+  Gtk.widgetAddCssClass runToolModeEntry "monospace"
+
+  runToolApplyBtn <- new Gtk.Button [#label := "Apply override"]
+  Gtk.widgetSetTooltipText runToolApplyBtn
+    (Just "Set a DLL override in HKCU\\Software\\Wine\\DllOverrides.")
+  Gtk.widgetSetValign runToolApplyBtn Gtk.AlignCenter
+
+  Gtk.boxAppend runToolOverrideBox runToolDllEntry
+  Gtk.boxAppend runToolOverrideBox runToolModeEntry
+  Gtk.boxAppend runToolOverrideBox runToolApplyBtn
+
+  runToolShowBtn <- new Gtk.Button [#label := "Show current overrides"]
+
+  runToolExtractBox <- new Gtk.Box
+    [ #orientation := Gtk.OrientationHorizontal, #spacing := 4 ]
+
+  runToolTargetEntry <- new Gtk.Entry
+    [ #placeholderText := "extract .msi to folder...", #hexpand := True ]
+  Gtk.widgetAddCssClass runToolTargetEntry "monospace"
+
+  runToolTargetBrowseBtn <- new Gtk.Button [#iconName := "folder-open-symbolic"]
+  Gtk.widgetSetTooltipText runToolTargetBrowseBtn (Just "Browse...")
+  Gtk.widgetSetValign runToolTargetBrowseBtn Gtk.AlignCenter
+
+  Gtk.boxAppend runToolExtractBox runToolTargetEntry
+  Gtk.boxAppend runToolExtractBox runToolTargetBrowseBtn
+
+  runToolExtractBtn <- new Gtk.Button [#label := "Extract .msi to folder"]
+  Gtk.widgetSetTooltipText runToolExtractBtn
+    (Just "Extract the .msi above (msiexec /a) into the target folder.")
+
+  runToolStatusLabel <- new Gtk.Label
+    [ #label := "", #halign := Gtk.AlignStart, #wrap := True ]
 
   Gtk.boxAppend runToolBox runToolTitle
   Gtk.boxAppend runToolBox runToolNote
   Gtk.boxAppend runToolBox runToolEntryBox
-  Gtk.boxAppend runToolBox runToolStatusLabel
   Gtk.boxAppend runToolBox runToolLaunchBtn
+  Gtk.boxAppend runToolBox runToolSep
+  Gtk.boxAppend runToolBox runToolToolsTitle
+  Gtk.boxAppend runToolBox runToolWinecfgBtn
+  Gtk.boxAppend runToolBox runToolOverrideBox
+  Gtk.boxAppend runToolBox runToolShowBtn
+  Gtk.boxAppend runToolBox runToolExtractBox
+  Gtk.boxAppend runToolBox runToolExtractBtn
+  Gtk.boxAppend runToolBox runToolStatusLabel
 
   runToolPopover <- new Gtk.Popover [#child := runToolBox]
   Gtk.menuButtonSetPopover runToolBtn (Just runToolPopover)
@@ -677,14 +734,10 @@ onActivate app = do
         Just path -> Gtk.editableSetText runToolEntry (T.pack path)
       )
 
-  -- ── Run Tool: launch ──────────────────────────────────────────────
-  _ <- on runToolLaunchBtn #clicked $ do
-    exePath <- T.unpack . T.strip <$> Gtk.editableGetText runToolEntry
-    if null exePath
-      then set runToolStatusLabel [#label := "Please enter a path to an executable or .msi installer."]
-      else do
+  -- Helper: effective wine prefix (preference, else first auto-detected one).
+  let resolveRunPrefix = do
         curState <- readIORef stateRef
-        prefix   <- if null (wsWinePrefix curState)
+        if null (wsWinePrefix curState)
           then do
             defaults <- defaultWinePrefixPaths
             existing <- filterM doesDirectoryExist defaults
@@ -692,6 +745,15 @@ onActivate app = do
               (p:_) -> p
               []    -> ""
           else return (wsWinePrefix curState)
+
+  -- ── Run Tool: launch ──────────────────────────────────────────────
+  _ <- on runToolLaunchBtn #clicked $ do
+    exePath <- T.unpack . T.strip <$> Gtk.editableGetText runToolEntry
+    if null exePath
+      then set runToolStatusLabel [#label := "Please enter a path to an executable or .msi installer."]
+      else do
+        curState <- readIORef stateRef
+        prefix   <- resolveRunPrefix
         if null prefix
           then set runToolStatusLabel [#label := "No Wine prefix found. Set one in Preferences."]
           else do
@@ -701,6 +763,75 @@ onActivate app = do
               Right () -> do
                 set runToolStatusLabel [#label := "Launched."]
                 Gtk.popoverPopdown runToolPopover
+
+  -- ── Prefix Tools: winecfg ─────────────────────────────────────────
+  _ <- on runToolWinecfgBtn #clicked $ do
+    curState <- readIORef stateRef
+    prefix   <- resolveRunPrefix
+    if null prefix
+      then set runToolStatusLabel [#label := "No Wine prefix found. Set one in Preferences."]
+      else do
+        result <- runWinecfg (wsWineExe curState) prefix
+        case result of
+          Left err -> set runToolStatusLabel [#label := err]
+          Right () -> set runToolStatusLabel [#label := "winecfg launched."]
+
+  -- ── Prefix Tools: set DLL override ────────────────────────────────
+  _ <- on runToolApplyBtn #clicked $ do
+    dll  <- T.unpack . T.strip <$> Gtk.editableGetText runToolDllEntry
+    mode <- T.unpack . T.strip <$> Gtk.editableGetText runToolModeEntry
+    curState <- readIORef stateRef
+    prefix   <- resolveRunPrefix
+    if null prefix
+      then set runToolStatusLabel [#label := "No Wine prefix found. Set one in Preferences."]
+      else do
+        result <- setDllOverride (wsWineExe curState) prefix dll mode
+        case result of
+          Left err -> set runToolStatusLabel [#label := err]
+          Right () -> set runToolStatusLabel
+            [#label := ("Override set: " <> T.pack dll <> " = " <> T.pack mode)]
+
+  -- ── Prefix Tools: show current overrides ──────────────────────────
+  _ <- on runToolShowBtn #clicked $ do
+    curState <- readIORef stateRef
+    prefix   <- resolveRunPrefix
+    if null prefix
+      then set runToolStatusLabel [#label := "No Wine prefix found. Set one in Preferences."]
+      else do
+        result <- getDllOverrides (wsWineExe curState) prefix
+        case result of
+          Left err -> set runToolStatusLabel [#label := err]
+          Right [] -> set runToolStatusLabel [#label := "No DLL overrides set."]
+          Right pairs -> set runToolStatusLabel
+            [#label := T.intercalate ", " [T.pack d <> " = " <> T.pack m | (d, m) <- pairs]]
+
+  -- ── Prefix Tools: browse extract folder ───────────────────────────
+  _ <- on runToolTargetBrowseBtn #clicked $ do
+    folderDialog <- new Gtk.FileDialog [#title := "Select Extract Folder"]
+    Gtk.fileDialogSelectFolder folderDialog (Just win) (Nothing @Gio.Cancellable) (Just $ \_obj res -> do
+      result <- (do
+        file <- Gtk.fileDialogSelectFolderFinish folderDialog res
+        Gio.fileGetPath file
+        ) `catch` (\(_ :: SomeException) -> return Nothing)
+      case result of
+        Nothing   -> return ()
+        Just path -> Gtk.editableSetText runToolTargetEntry (T.pack path)
+      )
+
+  -- ── Prefix Tools: extract .msi ────────────────────────────────────
+  _ <- on runToolExtractBtn #clicked $ do
+    msiPath <- T.unpack . T.strip <$> Gtk.editableGetText runToolEntry
+    target  <- T.unpack . T.strip <$> Gtk.editableGetText runToolTargetEntry
+    curState <- readIORef stateRef
+    prefix   <- resolveRunPrefix
+    if null prefix
+      then set runToolStatusLabel [#label := "No Wine prefix found. Set one in Preferences."]
+      else do
+        result <- msiAdminExtract (wsWineExe curState) prefix msiPath target
+        case result of
+          Left err -> set runToolStatusLabel [#label := err]
+          Right () -> set runToolStatusLabel
+            [#label := ("Extracted to " <> T.pack target)]
 
   -- ── Save window state on close ────────────────────────────────────
   _ <- on win #closeRequest $ do

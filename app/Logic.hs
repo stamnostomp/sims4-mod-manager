@@ -31,6 +31,10 @@ module Logic
   , importAny
   , defaultWinePrefixPaths
   , runInWinePrefix
+  , runWinecfg
+  , setDllOverride
+  , getDllOverrides
+  , msiAdminExtract
   , disableMod
   , enableMod
   , removeMod
@@ -39,9 +43,10 @@ module Logic
 import Codec.Archive.Zip (toArchive, zEntries, eRelativePath, fromEntry)
 import Control.Exception (SomeException, catch)
 import System.Environment (getEnvironment)
-import System.Process (createProcess, proc, CreateProcess(..))
+import System.Exit (ExitCode(..))
+import System.Process (createProcess, proc, readCreateProcessWithExitCode, CreateProcess(..))
 import Data.Bits ((.&.), shiftL, (.|.))
-import Data.Char (toLower)
+import Data.Char (toLower, isAlphaNum)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.List as List
@@ -58,6 +63,7 @@ import System.Directory
   , getHomeDirectory
   , getXdgDirectory
   , listDirectory
+  , makeAbsolute
   , removeFile
   , renameFile
   , XdgDirectory(..)
@@ -722,26 +728,167 @@ defaultWinePrefixPaths = do
 -- Returns immediately (does not wait for the process to exit).
 runInWinePrefix :: String -> FilePath -> FilePath -> IO (Either Text ())
 runInWinePrefix customWineExe prefix exePath = (do
+  eCmd <- resolveWineCommand customWineExe wineArgs
+  case eCmd of
+    Left err -> return (Left err)
+    Right (cmd, args) -> do
+      newEnv <- winePrefixEnv prefix
+      _ <- createProcess (proc cmd args) { env = Just newEnv }
+      return (Right ())
+  ) `catch` (\(e :: SomeException) ->
+      return (Left $ "Failed to launch: " <> T.pack (show e)))
+  where
+    isMsi = map toLower (takeExtension exePath) == ".msi"
+    -- For MSI installers Wine needs: wine msiexec /i setup.msi
+    wineArgs = if isMsi then ["msiexec", "/i", exePath] else [exePath]
+
+-- | Open winecfg for the given prefix (e.g. to manage DLL overrides by hand).
+-- Returns immediately (does not wait for winecfg to exit).
+runWinecfg :: String -> FilePath -> IO (Either Text ())
+runWinecfg customWineExe prefix = (do
+  eCmd <- resolveWineCommand customWineExe ["winecfg"]
+  case eCmd of
+    Left err -> return (Left err)
+    Right (cmd, args) -> do
+      newEnv <- winePrefixEnv prefix
+      _ <- createProcess (proc cmd args) { env = Just newEnv }
+      return (Right ())
+  ) `catch` (\(e :: SomeException) ->
+      return (Left $ "Failed to launch winecfg: " <> T.pack (show e)))
+
+-- | Set a Wine DLL override (@HKCU\Software\Wine\DllOverrides@) and wait for
+-- completion. Example: @setDllOverride wine prefix "version" "native,builtin"@.
+setDllOverride :: String -> FilePath -> String -> String -> IO (Either Text ())
+setDllOverride customWineExe prefix dll mode =
+  case validateDllOverride dll mode of
+    Just err -> return (Left err)
+    Nothing  -> do
+      result <- runWineWait customWineExe prefix
+        ["reg", "add", "HKCU\\Software\\Wine\\DllOverrides"
+        , "/v", dll, "/t", "REG_SZ", "/d", normMode, "/f"]
+      case result of
+        Left err -> return (Left err)
+        Right (ExitSuccess, _, _) -> return (Right ())
+        Right (ExitFailure n, _, errOut) ->
+          return (Left $ "reg add failed (exit "
+            <> T.pack (show n) <> "): " <> T.pack errOut)
+  where normMode = map toLower mode
+
+-- | List the current Wine DLL overrides for the prefix.
+getDllOverrides :: String -> FilePath -> IO (Either Text [(String, String)])
+getDllOverrides customWineExe prefix = do
+  result <- runWineWait customWineExe prefix
+    ["reg", "query", "HKCU\\Software\\Wine\\DllOverrides"]
+  case result of
+    Left err -> return (Left err)
+    -- Exit 1 on a missing key just means no overrides have been set yet.
+    Right (ExitFailure 1, _, _) -> return (Right [])
+    Right (ExitFailure n, _, _) -> return (Left $ "reg query failed (exit "
+      <> T.pack (show n) <> ")")
+    Right (ExitSuccess, out, _) -> return (Right (parseRegQuery out))
+
+-- | Administratively extract an @.msi@ file into a folder (the Wine
+-- equivalent of @msiextract@): @msiexec /a setup.msi TARGETDIR=... /qn@.
+-- The MSI's internal directory layout is preserved under the target folder,
+-- so extracted files can be inspected or copied where they are needed.
+-- Blocks until extraction finishes; can take a while for large installers.
+msiAdminExtract :: String -> FilePath -> FilePath -> FilePath -> IO (Either Text ())
+msiAdminExtract customWineExe prefix msiPath targetDir = (do
+  msiExists <- doesFileExist msiPath
+  if null msiPath
+    then return (Left "Select an .msi file to extract (top field).")
+    else if map toLower (takeExtension msiPath) /= ".msi"
+      then return (Left "The selected file is not an .msi installer.")
+      else if not msiExists
+        then return (Left "The selected .msi file does not exist.")
+        else if null targetDir
+          then return (Left "Select a folder to extract into.")
+          else do
+            createDirectoryIfMissing True targetDir
+            absMsi <- makeAbsolute msiPath
+            absTarget <- makeAbsolute targetDir
+            result <- runWineWait customWineExe prefix
+              ["msiexec", "/a", absMsi
+              , "TARGETDIR=" ++ unixToWinePath absTarget, "/qn"]
+            case result of
+              Left err -> return (Left err)
+              Right (ExitSuccess, _, _) -> return (Right ())
+              Right (ExitFailure n, _, errOut) ->
+                return (Left $ "msiexec failed (exit "
+                  <> T.pack (show n) <> "): " <> T.pack errOut)
+  ) `catch` (\(e :: SomeException) ->
+      return (Left $ "Failed to extract: " <> T.pack (show e)))
+
+-- | Run a wine command synchronously (with @WINEPREFIX@ set) and capture
+-- its exit code and output. Used for @reg@ and @msiexec@ calls where we
+-- need to know whether the operation succeeded.
+runWineWait :: String -> FilePath -> [String]
+            -> IO (Either Text (ExitCode, String, String))
+runWineWait customWineExe prefix wineArgs = (do
+  eCmd <- resolveWineCommand customWineExe wineArgs
+  case eCmd of
+    Left err -> return (Left err)
+    Right (cmd, args) -> do
+      newEnv <- winePrefixEnv prefix
+      Right <$> readCreateProcessWithExitCode (proc cmd args) { env = Just newEnv } ""
+  ) `catch` (\(e :: SomeException) -> return (Left $ T.pack (show e)))
+
+-- | Convert an absolute Unix path to a Wine path (@/tmp/x@ → @Z:\tmp\x@).
+-- Wine maps the Unix root to the @Z:@ drive.
+unixToWinePath :: FilePath -> FilePath
+unixToWinePath p = "Z:" ++ map slashToBackslash p
+  where
+    slashToBackslash '/' = '\\'
+    slashToBackslash c   = c
+
+-- | Build the environment with @WINEPREFIX@ set to the given prefix.
+winePrefixEnv :: FilePath -> IO [(String, String)]
+winePrefixEnv prefix = do
+  currentEnv <- getEnvironment
+  return $ ("WINEPREFIX", prefix) : filter ((/= "WINEPREFIX") . fst) currentEnv
+
+-- | Resolve the wine binary and wrap the call in @steam-run@ on NixOS
+-- so that the Proton wine binary finds its libraries.
+resolveWineCommand :: String -> [String] -> IO (Either Text (FilePath, [String]))
+resolveWineCommand customWineExe wineArgs = do
   mWine <- resolveWineExe customWineExe
   case mWine of
     Nothing -> return (Left
       "wine not found. Set a Wine executable path in Preferences\
       \ (e.g. the Proton wine64 inside your Steam installation).")
     Just wine -> do
-      currentEnv <- getEnvironment
-      let newEnv = ("WINEPREFIX", prefix)
-                   : filter ((/= "WINEPREFIX") . fst) currentEnv
       mSteamRun <- findSteamRun
-      let isMsi = map toLower (takeExtension exePath) == ".msi"
-          -- For MSI installers Wine needs: wine msiexec /i setup.msi
-          wineArgs = if isMsi then ["msiexec", "/i", exePath] else [exePath]
-          (cmd, args) = case mSteamRun of
-            Just sr -> (sr, wine : wineArgs)  -- NixOS: steam-run wine64 [msiexec /i] exe
-            Nothing -> (wine, wineArgs)       -- standard Linux: wine64 [msiexec /i] exe
-      _ <- createProcess (proc cmd args) { env = Just newEnv }
-      return (Right ())
-  ) `catch` (\(e :: SomeException) ->
-      return (Left $ "Failed to launch: " <> T.pack (show e)))
+      case mSteamRun of
+        Just sr -> return (Right (sr, wine : wineArgs))  -- NixOS: steam-run wine64 ...
+        Nothing -> return (Right (wine, wineArgs))       -- standard Linux: wine64 ...
+
+-- | Validate a DLL override pair. Returns an error message when invalid.
+validateDllOverride :: String -> String -> Maybe Text
+validateDllOverride dll mode
+  | null dll = Just "Enter a DLL name (e.g. version)."
+  | not (all isDllChar dll) =
+      Just "DLL name may only contain letters, digits, '_', '-' or '.'."
+  | null modes = Just "Enter a mode (e.g. native,builtin)."
+  | not (all isGoodMode modes) =
+      Just "Mode must combine builtin, native or disabled (e.g. native,builtin)."
+  | otherwise = Nothing
+  where
+    modes = splitComma (map toLower mode)
+    isDllChar c = isAlphaNum c || c `elem` ("-_." :: String)
+    isGoodMode m = m `elem` ["builtin", "native", "disabled"]
+    splitComma s = case break (== ',') s of
+      (w, [])   -> [w]
+      (w, _:rs) -> w : splitComma rs
+
+-- | Parse @reg query DllOverrides@ output into @(dll, mode)@ pairs.
+parseRegQuery :: String -> [(String, String)]
+parseRegQuery out = concatMap parseLine (lines out)
+  where
+    parseLine line = case words line of
+      (name : typ : rest)
+        | "REG_" `List.isPrefixOf` typ
+        , not (null name), head name /= '(' -> [(name, unwords rest)]
+      _ -> []
 
 -- | Resolve which wine binary to use.
 -- If @custom@ is non-empty, treat it as a path or executable name.
