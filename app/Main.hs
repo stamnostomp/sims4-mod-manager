@@ -296,7 +296,7 @@ onActivate app = do
     [ #orientation := Gtk.OrientationHorizontal, #spacing := 4 ]
 
   runToolEntry <- new Gtk.Entry
-    [ #placeholderText := "/path/to/tool.exe", #hexpand := True ]
+    [ #placeholderText := "/path/to/tool.exe or setup.msi", #hexpand := True ]
   Gtk.widgetAddCssClass runToolEntry "monospace"
 
   runToolBrowseBtn <- new Gtk.Button [#iconName := "folder-open-symbolic"]
@@ -653,11 +653,12 @@ onActivate app = do
         set prefsStatusLabel [#label := "Saved."]
         Gtk.popoverPopdown prefsPopover
 
-  -- ── Run Tool: browse .exe ─────────────────────────────────────────
+  -- ── Run Tool: browse .exe/.msi ────────────────────────────────────
   _ <- on runToolBrowseBtn #clicked $ do
-    fileDialog <- new Gtk.FileDialog [#title := "Select Executable"]
-    exeFilter  <- new Gtk.FileFilter [#name := "Windows Executables (*.exe)"]
+    fileDialog <- new Gtk.FileDialog [#title := "Select Executable or Installer"]
+    exeFilter  <- new Gtk.FileFilter [#name := "Windows Executables and Installers (*.exe, *.msi)"]
     Gtk.fileFilterAddPattern exeFilter "*.exe"
+    Gtk.fileFilterAddPattern exeFilter "*.msi"
     allFilter  <- new Gtk.FileFilter [#name := "All Files (*)"]
     Gtk.fileFilterAddPattern allFilter "*"
     fileFilterType <- glibType @Gtk.FileFilter
@@ -680,7 +681,7 @@ onActivate app = do
   _ <- on runToolLaunchBtn #clicked $ do
     exePath <- T.unpack . T.strip <$> Gtk.editableGetText runToolEntry
     if null exePath
-      then set runToolStatusLabel [#label := "Please enter a path to an executable."]
+      then set runToolStatusLabel [#label := "Please enter a path to an executable or .msi installer."]
       else do
         curState <- readIORef stateRef
         prefix   <- if null (wsWinePrefix curState)

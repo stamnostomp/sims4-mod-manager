@@ -41,6 +41,7 @@ import Control.Exception (SomeException, catch)
 import System.Environment (getEnvironment)
 import System.Process (createProcess, proc, CreateProcess(..))
 import Data.Bits ((.&.), shiftL, (.|.))
+import Data.Char (toLower)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.List as List
@@ -717,6 +718,7 @@ defaultWinePrefixPaths = do
 -- @customWineExe@: path or name of the wine binary to use; empty = auto-detect.
 -- On NixOS, wraps the call in @steam-run@ when available so that the Proton
 -- wine binary can find its dynamically linked libraries.
+-- @.msi@ files are installed via @msiexec /i@, everything else is run directly.
 -- Returns immediately (does not wait for the process to exit).
 runInWinePrefix :: String -> FilePath -> FilePath -> IO (Either Text ())
 runInWinePrefix customWineExe prefix exePath = (do
@@ -730,9 +732,12 @@ runInWinePrefix customWineExe prefix exePath = (do
       let newEnv = ("WINEPREFIX", prefix)
                    : filter ((/= "WINEPREFIX") . fst) currentEnv
       mSteamRun <- findSteamRun
-      let (cmd, args) = case mSteamRun of
-            Just sr -> (sr, [wine, exePath])   -- NixOS: steam-run wine64 exe
-            Nothing -> (wine, [exePath])        -- standard Linux: wine64 exe
+      let isMsi = map toLower (takeExtension exePath) == ".msi"
+          -- For MSI installers Wine needs: wine msiexec /i setup.msi
+          wineArgs = if isMsi then ["msiexec", "/i", exePath] else [exePath]
+          (cmd, args) = case mSteamRun of
+            Just sr -> (sr, wine : wineArgs)  -- NixOS: steam-run wine64 [msiexec /i] exe
+            Nothing -> (wine, wineArgs)       -- standard Linux: wine64 [msiexec /i] exe
       _ <- createProcess (proc cmd args) { env = Just newEnv }
       return (Right ())
   ) `catch` (\(e :: SomeException) ->
